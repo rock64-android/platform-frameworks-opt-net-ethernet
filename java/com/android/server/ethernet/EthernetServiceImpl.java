@@ -74,10 +74,26 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
                 "EthernetService");
     }
 
+    private void enforceChangePermission() {
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.CHANGE_NETWORK_STATE,
+                "EthernetService");
+    }
+
     private void enforceConnectivityInternalPermission() {
         mContext.enforceCallingOrSelfPermission(
                 android.Manifest.permission.CONNECTIVITY_INTERNAL,
                 "ConnectivityService");
+    }
+
+    public boolean setEthernetEnabled(boolean enable) {
+        //enforceChangePermission();
+        Log.i(TAG,"setEthernetEnabled() : enable="+enable);
+        if ( enable ) {
+           return mTracker.setInterfaceUp();
+        } else {
+           return mTracker.setInterfaceDown(); 
+        }
     }
 
     public void start() {
@@ -114,6 +130,7 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
             Log.w(TAG, "System isn't ready enough to change ethernet configuration");
         }
 
+        enforceChangePermission();
         enforceConnectivityInternalPermission();
 
         synchronized (mIpConfiguration) {
@@ -161,6 +178,18 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
         }
         enforceAccessPermission();
         mListeners.unregister(listener);
+    }
+
+    @Override
+    public int getEthernetConnectState() {
+        // enforceAccessPermission();
+        Log.d(TAG,"getEthernetEnabledState() : Entered.");
+        return mTracker.mEthernetCurrentState;
+    }
+
+    @Override
+    public int getEthernetIfaceState() {
+        return mTracker.getEthernetIfaceState();
     }
 
     @Override
