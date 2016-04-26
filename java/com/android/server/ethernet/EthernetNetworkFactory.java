@@ -488,6 +488,24 @@ class EthernetNetworkFactory {
         dhcpThread.start();
     }
 
+    private int getEthernetCarrierState() {
+        if(mIfaceMatch != "") {
+                try {
+                    File file = new File("/sys/class/net/"+"eth0"+"/carrier");
+                    String carrier = ReadFromFile(file);
+                    Log.d(TAG, "carrier = " + carrier);
+                    int carrier_int = Integer.parseInt(carrier);
+                    return carrier_int;
+                }
+            catch(Exception e) {
+                e.printStackTrace();
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
     /**
      * Begin monitoring connectivity
      */
@@ -532,7 +550,8 @@ class EthernetNetworkFactory {
                         // configuring it. Since we're already holding the lock,
                         // any real link up/down notification will only arrive
                         // after we've done this.
-                        if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                        //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                        if (getEthernetCarrierState() == 1) {
                             updateInterfaceState(iface, true);
                         }
                         break;
