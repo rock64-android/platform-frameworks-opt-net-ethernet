@@ -44,6 +44,19 @@ import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.text.TextUtils;
 import android.util.Log;
+import android.content.Intent;
+import android.os.UserHandle;
+import android.provider.Settings;
+
+import java.io.FileDescriptor;
+import java.io.File;
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.lang.Exception;
 
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.server.net.BaseNetworkObserver;
@@ -105,6 +118,59 @@ class EthernetNetworkFactory {
     private IpManager mIpManager;
     private Thread mIpProvisioningThread;
 
+    public int mEthernetCurrentState = EthernetManager.ETHER_STATE_DISCONNECTED;
+
+    private String dumpEthCurrentState(int curState) {
+        if (curState == EthernetManager.ETHER_STATE_DISCONNECTED)
+            return "DISCONNECTED";
+        else if (curState == EthernetManager.ETHER_STATE_CONNECTING)
+            return "CONNECTING";
+        else if (curState == EthernetManager.ETHER_STATE_CONNECTED)
+            return "CONNECTED";
+        return "DISCONNECTED";
+    }
+
+    private void sendEthernetStateChangedBroadcast(int curState) {
+        if (mEthernetCurrentState == curState)
+            return;
+        Log.d(TAG, "sendEthernetStateChangedBroadcast: curState = " + dumpEthCurrentState(curState));
+        mEthernetCurrentState = curState;
+        final Intent intent = new Intent(EthernetManager.ETHERNET_STATE_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(EthernetManager.EXTRA_ETHERNET_STATE, curState);
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+    }
+
+    private String ReadFromFile(File file) {
+        if((file != null) && file.exists()) {
+            try {
+                FileInputStream fin= new FileInputStream(file);
+                BufferedReader reader= new BufferedReader(new InputStreamReader(fin));
+                String flag = reader.readLine();
+                fin.close();
+                return flag;
+            } catch(Exception e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
+    }
+
+    private int getEthernetCarrierState(String ifname) {
+        if(ifname != "") {
+            try {
+                File file = new File("/sys/class/net/" + ifname + "/carrier");
+                String carrier = ReadFromFile(file);
+                return Integer.parseInt(carrier);
+            } catch(Exception e) {
+                e.printStackTrace();
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
     EthernetNetworkFactory(RemoteCallbackList<IEthernetServiceListener> listeners) {
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
         mLinkProperties = new LinkProperties();
@@ -157,6 +223,7 @@ class EthernetNetworkFactory {
                 // Tell the agent we're disconnected. It will call disconnect().
                 mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
                 stopIpProvisioningThreadLocked();
+                sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
             }
             updateAgent();
             // set our score lower than any network could go
@@ -174,17 +241,20 @@ class EthernetNetworkFactory {
 
         @Override
         public void interfaceAdded(String iface) {
+            Log.d(TAG, "interfaceAdded: " + iface);
             maybeTrackInterface(iface);
         }
 
         @Override
         public void interfaceRemoved(String iface) {
+            Log.d(TAG, "interfaceRemoved: " + iface);
             stopTrackingInterface(iface);
         }
     }
 
     private void setInterfaceUp(String iface) {
         // Bring up the interface so we get link status indications.
+        Log.d(TAG, "setInterfaceUp: " + iface);
         try {
             mNMService.setInterfaceUp(iface);
             String hwAddr = null;
@@ -237,6 +307,7 @@ class EthernetNetworkFactory {
             mNetworkAgent = null;
             mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
             mLinkProperties = new LinkProperties();
+            sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
         }
     }
 
@@ -278,12 +349,19 @@ class EthernetNetworkFactory {
 
     /* Called by the NetworkFactory on the handler thread. */
     public void onRequestNetwork() {
+        int carrier = getEthernetCarrierState(mIface);
+        Log.d(TAG, "onRequestNetwork: " + mIface + " carrier = " + carrier);
+        if (carrier != 1) {
+            return;
+        }
+
         synchronized(EthernetNetworkFactory.this) {
             if (mIpProvisioningThread != null) {
                 return;
             }
         }
 
+        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_CONNECTING);
         final Thread ipProvisioningThread = new Thread(new Runnable() {
             public void run() {
                 if (DBG) {
@@ -296,16 +374,20 @@ class EthernetNetworkFactory {
                 IpConfiguration config = mEthernetManager.getConfiguration();
 
                 if (config.getIpAssignment() == IpAssignment.STATIC) {
+                    Log.d(TAG, "config STATIC");
                     if (!setStaticIpAddress(config.getStaticIpConfiguration())) {
                         // We've already logged an error.
+                        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                         return;
                     }
                     linkProperties = config.getStaticIpConfiguration().toLinkProperties(mIface);
                 } else {
+                    Log.d(TAG, "config DHCP");
                     mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
                     WaitForProvisioningCallback ipmCallback = new WaitForProvisioningCallback() {
                         @Override
                         public void onLinkPropertiesChange(LinkProperties newLp) {
+                            Log.d(TAG, "onLinkPropertiesChange: lp = " + newLp);
                             synchronized(EthernetNetworkFactory.this) {
                                 if (mNetworkAgent != null && mNetworkInfo.isConnected()) {
                                     mLinkProperties = newLp;
@@ -346,6 +428,7 @@ class EthernetNetworkFactory {
                         synchronized(EthernetNetworkFactory.this) {
                             stopIpManagerLocked();
                         }
+                        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                         return;
                     }
                 }
@@ -357,9 +440,11 @@ class EthernetNetworkFactory {
                         mIpProvisioningThread = null;
                         return;
                     }
+                    Log.d(TAG, "IP provisioning success: lp = " + linkProperties);
                     mLinkProperties = linkProperties;
                     mNetworkInfo.setIsAvailable(true);
                     mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
+                    sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_CONNECTED);
 
                     // Create our NetworkAgent.
                     mNetworkAgent = new NetworkAgent(mFactory.getLooper(), mContext,
@@ -368,6 +453,7 @@ class EthernetNetworkFactory {
                         public void unwanted() {
                             synchronized(EthernetNetworkFactory.this) {
                                 if (this == mNetworkAgent) {
+                                    Log.d(TAG, "unwanted");
                                     stopIpManagerLocked();
 
                                     mLinkProperties.clear();
@@ -380,6 +466,7 @@ class EthernetNetworkFactory {
                                     } catch (Exception e) {
                                         Log.e(TAG, "Failed to clear addresses or disable ipv6" + e);
                                     }
+                                    sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                                 } else {
                                     Log.d(TAG, "Ignoring unwanted as we have a more modern " +
                                             "instance");
@@ -418,6 +505,7 @@ class EthernetNetworkFactory {
         // Interface match regex.
         mIfaceMatch = context.getResources().getString(
                 com.android.internal.R.string.config_ethernet_iface_regex);
+        Log.d(TAG, "EthernetNetworkFactory start " + mIfaceMatch);
 
         // Create and register our NetworkFactory.
         mFactory = new LocalNetworkFactory(NETWORK_TYPE, context, target.getLooper());
@@ -449,7 +537,10 @@ class EthernetNetworkFactory {
                         // configuring it. Since we're already holding the lock,
                         // any real link up/down notification will only arrive
                         // after we've done this.
-                        if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                        //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                        int carrier = getEthernetCarrierState(iface);
+						Log.d(TAG, iface + " carrier = " + carrier);
+                        if (carrier == 1) {
                             updateInterfaceState(iface, true);
                         }
                         break;
@@ -462,6 +553,7 @@ class EthernetNetworkFactory {
     }
 
     public synchronized void stop() {
+        Log.d(TAG, "EthernetNetworkFactory stop");
         stopIpProvisioningThreadLocked();
         // ConnectivityService will only forget our NetworkAgent if we send it a NetworkInfo object
         // with a state of DISCONNECTED or SUSPENDED. So we can't simply clear our NetworkInfo here:
@@ -477,6 +569,7 @@ class EthernetNetworkFactory {
         setInterfaceInfoLocked("", null);
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
         mFactory.unregister();
+        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
     }
 
     private void initNetworkCapabilities() {
@@ -526,6 +619,9 @@ class EthernetNetworkFactory {
         } else {
             pw.println("Not tracking any interface");
         }
+
+        pw.println();
+        pw.println("mEthernetCurrentState: " + dumpEthCurrentState(mEthernetCurrentState));
 
         pw.println();
         pw.println("NetworkInfo: " + mNetworkInfo);
