@@ -123,8 +123,12 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
             // Fix this by making IpConfiguration a complete representation of static configuration.
             if (!config.equals(mIpConfiguration)) {
                 mIpConfiguration = new IpConfiguration(config);
-                mTracker.stop();
-                mTracker.start(mContext, mHandler);
+                if (false) { // old android original method
+                    mTracker.stop();
+                    mTracker.start(mContext, mHandler);
+                } else { // new method
+                    mTracker.reconnect("eth0");
+                }
             }
         }
     }
@@ -161,6 +165,48 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
         }
         enforceAccessPermission();
         mListeners.unregister(listener);
+    }
+
+    @Override
+    public int getEthernetCarrierState(String ifname) {
+        enforceAccessPermission();
+        return mTracker.getEthernetCarrierState(ifname);
+    }
+
+    @Override
+    public String getEthernetMacAddress(String ifname) {
+        enforceAccessPermission();
+        return mTracker.getEthernetMacAddress(ifname);
+    }
+
+    @Override
+    public int getEthernetConnectState() {
+        enforceAccessPermission();
+        return mTracker.mEthernetCurrentState;
+    }
+
+    @Override
+    public String getIpAddress() {
+        enforceAccessPermission();
+        return mTracker.getIpAddress();
+    }
+
+    @Override
+    public String getNetmask() {
+        enforceAccessPermission();
+        return mTracker.getNetmask();
+    }
+
+    @Override
+    public String getGateway() {
+        enforceAccessPermission();
+        return mTracker.getGateway();
+    }
+
+    @Override
+    public String getDns() {
+        enforceAccessPermission();
+        return mTracker.getDns();
     }
 
     @Override

@@ -35,6 +35,9 @@ import android.net.StaticIpConfiguration;
 import android.net.ip.IpManager;
 import android.net.ip.IpManager.ProvisioningConfiguration;
 import android.net.ip.IpManager.WaitForProvisioningCallback;
+import android.net.RouteInfo;
+import android.net.LinkAddress;
+
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.INetworkManagementService;
@@ -57,6 +60,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.Exception;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.server.net.BaseNetworkObserver;
@@ -119,6 +125,7 @@ class EthernetNetworkFactory {
     private Thread mIpProvisioningThread;
 
     public int mEthernetCurrentState = EthernetManager.ETHER_STATE_DISCONNECTED;
+    private boolean mReconnecting;
 
     private String dumpEthCurrentState(int curState) {
         if (curState == EthernetManager.ETHER_STATE_DISCONNECTED)
@@ -154,21 +161,6 @@ class EthernetNetworkFactory {
             }
         }
         return null;
-    }
-
-    private int getEthernetCarrierState(String ifname) {
-        if(ifname != "") {
-            try {
-                File file = new File("/sys/class/net/" + ifname + "/carrier");
-                String carrier = ReadFromFile(file);
-                return Integer.parseInt(carrier);
-            } catch(Exception e) {
-                e.printStackTrace();
-                return 0;
-            }
-        } else {
-            return 0;
-        }
     }
 
     EthernetNetworkFactory(RemoteCallbackList<IEthernetServiceListener> listeners) {
@@ -214,7 +206,13 @@ class EthernetNetworkFactory {
         if (!mIface.equals(iface)) {
             return;
         }
-        Log.d(TAG, "updateInterface: " + iface + " link " + (up ? "up" : "down"));
+        if (!mReconnecting)
+            Log.d(TAG, "updateInterface: " + iface + " link " + (up ? "up" : "down"));
+
+        if (up && mEthernetCurrentState != EthernetManager.ETHER_STATE_DISCONNECTED) {
+            Log.d(TAG, "Already connected or connecting, skip connect");
+            return;
+        }
 
         synchronized(this) {
             mLinkUp = up;
@@ -231,6 +229,24 @@ class EthernetNetworkFactory {
             // when link goes down.
             mFactory.setScoreFilter(up ? NETWORK_SCORE : -1);
         }
+    }
+
+    // first disconnect, then connect
+    public void reconnect(String iface) {
+        Log.d(TAG, "reconnect:");
+        mReconnecting = true;
+
+        Log.d(TAG, "first disconnect");
+        updateInterfaceState(iface, false);
+
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException ignore) {
+        }
+
+        Log.d(TAG, "then connect");
+        updateInterfaceState(iface, true);
+        mReconnecting = false;
     }
 
     private class InterfaceObserver extends BaseNetworkObserver {
@@ -514,6 +530,7 @@ class EthernetNetworkFactory {
         mFactory.register();
 
         mContext = context;
+        mReconnecting = false;
 
         // Start tracking interface change events.
         mInterfaceObserver = new InterfaceObserver();
@@ -539,7 +556,7 @@ class EthernetNetworkFactory {
                         // after we've done this.
                         //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
                         int carrier = getEthernetCarrierState(iface);
-						Log.d(TAG, iface + " carrier = " + carrier);
+                        Log.d(TAG, iface + " carrier = " + carrier);
                         if (carrier == 1) {
                             updateInterfaceState(iface, true);
                         }
@@ -584,6 +601,109 @@ class EthernetNetworkFactory {
 
     public synchronized boolean isTrackingInterface() {
         return !TextUtils.isEmpty(mIface);
+    }
+
+    public int getEthernetCarrierState(String ifname) {
+        if(ifname != "") {
+            try {
+                File file = new File("/sys/class/net/" + ifname + "/carrier");
+                String carrier = ReadFromFile(file);
+                return Integer.parseInt(carrier);
+            } catch(Exception e) {
+                e.printStackTrace();
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    public String getEthernetMacAddress(String ifname) {
+        if(ifname != "") {
+            try {
+                File file = new File("/sys/class/net/" + ifname + "/address");
+                String address = ReadFromFile(file);
+                return address;
+            } catch(Exception e) {
+                e.printStackTrace();
+                return "";
+            }
+        } else {
+            return "";
+        }
+    }
+
+    public String getIpAddress() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return config.getStaticIpConfiguration().ipAddress.getAddress().getHostAddress();
+        } else {
+            for (LinkAddress l : mLinkProperties.getLinkAddresses()) {
+                InetAddress source = l.getAddress();
+                //Log.d(TAG, "getIpAddress: " + source.getHostAddress());
+                if (source instanceof Inet4Address) {
+                    return source.getHostAddress();
+                }
+            }
+        }
+        return "";
+    }
+
+    private String prefix2netmask(int prefix) {
+        // convert prefix to netmask
+        int mask = 0xFFFFFFFF << (32 - prefix);
+        //Log.d(TAG, "mask = " + mask + " prefix = " + prefix);
+        return ((mask>>>24) & 0xff) + "." + ((mask>>>16) & 0xff) + "." + ((mask>>>8) & 0xff) + "." + ((mask) & 0xff);
+    }
+
+    public String getNetmask() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return prefix2netmask(config.getStaticIpConfiguration().ipAddress.getPrefixLength());
+        } else {
+            for (LinkAddress l : mLinkProperties.getLinkAddresses()) {
+                InetAddress source = l.getAddress();
+                if (source instanceof Inet4Address) {
+                    return prefix2netmask(l.getPrefixLength());
+                }
+            }
+        }
+        return "";
+    }
+	
+    public String getGateway() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return config.getStaticIpConfiguration().gateway.getHostAddress();
+        } else {
+            for (RouteInfo route : mLinkProperties.getRoutes()) {
+                if (route.hasGateway()) {
+                    InetAddress gateway = route.getGateway();
+                    if (route.isIPv4Default()) {
+                        return gateway.getHostAddress();
+                    }
+                }
+            }
+        }
+        return "";		
+    }
+
+    /*
+     * return dns format: "8.8.8.8,4.4.4.4"
+     */
+    public String getDns() {
+        String dns = "";
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            for (InetAddress nameserver : config.getStaticIpConfiguration().dnsServers) {
+                dns += nameserver.getHostAddress() + ",";
+            }			
+        } else {		
+            for (InetAddress nameserver : mLinkProperties.getDnsServers()) {
+                dns += nameserver.getHostAddress() + ",";
+            }
+        }
+        return dns;		
     }
 
     /**
