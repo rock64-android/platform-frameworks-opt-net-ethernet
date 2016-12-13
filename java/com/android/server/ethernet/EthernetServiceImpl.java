@@ -116,12 +116,13 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
 
         enforceConnectivityInternalPermission();
 
+        Log.d(TAG, "setConfiguration: " + config.pppoeAccount + ", " + config.pppoePassword);
         synchronized (mIpConfiguration) {
             mEthernetConfigStore.writeIpAndProxyConfigurations(config);
 
             // TODO: this does not check proxy settings, gateways, etc.
             // Fix this by making IpConfiguration a complete representation of static configuration.
-            if (!config.equals(mIpConfiguration)) {
+            if (true/*!config.equals(mIpConfiguration)*/) {
                 mIpConfiguration = new IpConfiguration(config);
                 if (false) { // old android original method
                     mTracker.stop();
@@ -207,6 +208,24 @@ public class EthernetServiceImpl extends IEthernetManager.Stub {
     public String getDns() {
         enforceAccessPermission();
         return mTracker.getDns();
+    }
+
+    @Override
+    public String dumpCurrentState(int state) {
+        enforceAccessPermission();
+        return mTracker.dumpEthCurrentState(state);
+    }
+
+    @Override
+    public void reconnect(String iface) {
+        enforceAccessPermission();
+        mTracker.reconnect(iface);
+    }
+
+    @Override
+    public void disconnect(String iface) {
+        enforceAccessPermission();
+        mTracker.disconnect(iface);
     }
 
     @Override

@@ -21,6 +21,7 @@ import android.net.ConnectivityManager;
 import android.net.DhcpResults;
 import android.net.EthernetManager;
 import android.net.IEthernetServiceListener;
+import android.net.PppoeManager;
 import android.net.InterfaceConfiguration;
 import android.net.IpConfiguration;
 import android.net.IpConfiguration.IpAssignment;
@@ -37,6 +38,7 @@ import android.net.ip.IpManager.ProvisioningConfiguration;
 import android.net.ip.IpManager.WaitForProvisioningCallback;
 import android.net.RouteInfo;
 import android.net.LinkAddress;
+import android.net.NetworkUtils;
 
 import android.os.Handler;
 import android.os.IBinder;
@@ -100,6 +102,8 @@ class EthernetNetworkFactory {
     /** For static IP configuration */
     private EthernetManager mEthernetManager;
 
+    private PppoeManager mPppoeManager;
+
     /** To set link state and configure IP addresses. */
     private INetworkManagementService mNMService;
 
@@ -126,14 +130,17 @@ class EthernetNetworkFactory {
 
     public int mEthernetCurrentState = EthernetManager.ETHER_STATE_DISCONNECTED;
     private boolean mReconnecting;
+    private IpAssignment mConnectMode;
 
-    private String dumpEthCurrentState(int curState) {
+    public String dumpEthCurrentState(int curState) {
         if (curState == EthernetManager.ETHER_STATE_DISCONNECTED)
             return "DISCONNECTED";
         else if (curState == EthernetManager.ETHER_STATE_CONNECTING)
             return "CONNECTING";
         else if (curState == EthernetManager.ETHER_STATE_CONNECTED)
             return "CONNECTED";
+        else if (curState == EthernetManager.ETHER_STATE_DISCONNECTING)
+            return "DISCONNECTING";
         return "DISCONNECTED";
     }
 
@@ -198,6 +205,16 @@ class EthernetNetworkFactory {
         }
     }
 
+    private void infoExitIpProvisioningThread() {
+        synchronized(EthernetNetworkFactory.this) {
+            mIpProvisioningThread = null;
+        }
+        if (DBG) {
+            Log.d(TAG, String.format("exiting ipProvisioningThread(%s): mNetworkInfo=%s",
+                            mIface, mNetworkInfo));
+        }		
+    }
+
     /**
      * Updates interface state variables.
      * Called on link state changes or on startup.
@@ -218,8 +235,14 @@ class EthernetNetworkFactory {
             mLinkUp = up;
             mNetworkInfo.setIsAvailable(up);
             if (!up) {
+                sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTING);
                 // Tell the agent we're disconnected. It will call disconnect().
                 mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
+                if (mConnectMode == IpAssignment.PPPOE) {
+                    Log.d(TAG, "before pppoe disconnect");
+                    mPppoeManager.disconnect(mIface);
+                    Log.d(TAG, "after pppoe disconnect");
+                }
                 stopIpProvisioningThreadLocked();
                 sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
             }
@@ -236,6 +259,9 @@ class EthernetNetworkFactory {
         Log.d(TAG, "reconnect:");
         mReconnecting = true;
 
+        if (iface == null)
+            iface = mIface;
+
         Log.d(TAG, "first disconnect");
         updateInterfaceState(iface, false);
 
@@ -246,6 +272,17 @@ class EthernetNetworkFactory {
 
         Log.d(TAG, "then connect");
         updateInterfaceState(iface, true);
+        mReconnecting = false;
+    }
+
+    public void disconnect(String iface) {
+        Log.d(TAG, "disconnect:");
+        mReconnecting = true;
+
+        if (iface == null)
+            iface = mIface;
+
+        updateInterfaceState(iface, false);
         mReconnecting = false;
     }
 
@@ -373,6 +410,7 @@ class EthernetNetworkFactory {
 
         synchronized(EthernetNetworkFactory.this) {
             if (mIpProvisioningThread != null) {
+                Log.d(TAG, "mIpProvisioningThread is already running");
                 return;
             }
         }
@@ -388,15 +426,44 @@ class EthernetNetworkFactory {
                 LinkProperties linkProperties;
 
                 IpConfiguration config = mEthernetManager.getConfiguration();
-
+                mConnectMode = config.getIpAssignment();
+                if (mPppoeManager == null) {
+                    mConnectMode = IpAssignment.DHCP;
+                    Log.d(TAG, "mPppoeManager == null, set mConnectMode to DHCP");
+                }
                 if (config.getIpAssignment() == IpAssignment.STATIC) {
                     Log.d(TAG, "config STATIC");
                     if (!setStaticIpAddress(config.getStaticIpConfiguration())) {
                         // We've already logged an error.
                         sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
+                        infoExitIpProvisioningThread();
                         return;
                     }
                     linkProperties = config.getStaticIpConfiguration().toLinkProperties(mIface);
+                } else if (config.getIpAssignment() == IpAssignment.PPPOE) {
+                    Log.d(TAG, "config PPPOE");
+                    Log.d(TAG, "start pppoe connect: " + config.pppoeAccount + ", " + config.pppoePassword);
+                    mPppoeManager.connect(config.pppoeAccount, config.pppoePassword, mIface);
+
+                    int state = mPppoeManager.getPppoeState();
+                    Log.d(TAG, "end pppoe connect: state = " + mPppoeManager.dumpCurrentState(state));
+                    if (state == PppoeManager.PPPOE_STATE_CONNECT) {
+                        linkProperties = mPppoeManager.getLinkProperties();
+                        String iface = mPppoeManager.getPppIfaceName();
+                        /*Log.d(TAG, "addInterfaceToLocalNetwork: iface = " + iface + ", route = " + linkProperties.getRoutes()); 
+                        try {
+                            mNMService.addInterfaceToLocalNetwork(iface, linkProperties.getRoutes());
+                        } catch (RemoteException e) {
+                            Log.e(TAG, "Failed to add iface " + iface + " to local network " + e);
+                        }*/
+                        linkProperties.setInterfaceName(iface);
+                    } else {
+                        Log.e(TAG, "pppoe connect failed.");
+                        //mFactory.setScoreFilter(-1);
+                        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
+                        infoExitIpProvisioningThread();
+                        return;
+                    }
                 } else {
                     Log.d(TAG, "config DHCP");
                     mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
@@ -445,6 +512,7 @@ class EthernetNetworkFactory {
                             stopIpManagerLocked();
                         }
                         sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
+                        infoExitIpProvisioningThread();					
                         return;
                     }
                 }
@@ -453,10 +521,10 @@ class EthernetNetworkFactory {
                     if (mNetworkAgent != null) {
                         Log.e(TAG, "Already have a NetworkAgent - aborting new request");
                         stopIpManagerLocked();
-                        mIpProvisioningThread = null;
+                        infoExitIpProvisioningThread();
                         return;
                     }
-                    Log.d(TAG, "IP provisioning success: lp = " + linkProperties);
+                    Log.d(TAG, "success get ip: lp = " + linkProperties);
                     mLinkProperties = linkProperties;
                     mNetworkInfo.setIsAvailable(true);
                     mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
@@ -490,14 +558,9 @@ class EthernetNetworkFactory {
                             }
                         };
                     };
-
-                    mIpProvisioningThread = null;
                 }
 
-                if (DBG) {
-                    Log.d(TAG, String.format("exiting ipProvisioningThread(%s): mNetworkInfo=%s",
-                            mIface, mNetworkInfo));
-                }
+                infoExitIpProvisioningThread();
             }
         });
 
@@ -517,6 +580,7 @@ class EthernetNetworkFactory {
         IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
         mNMService = INetworkManagementService.Stub.asInterface(b);
         mEthernetManager = (EthernetManager) context.getSystemService(Context.ETHERNET_SERVICE);
+        mPppoeManager = (PppoeManager) context.getSystemService(Context.PPPOE_SERVICE);
 
         // Interface match regex.
         mIfaceMatch = context.getResources().getString(
@@ -531,6 +595,7 @@ class EthernetNetworkFactory {
 
         mContext = context;
         mReconnecting = false;
+        mConnectMode = IpAssignment.DHCP;
 
         // Start tracking interface change events.
         mInterfaceObserver = new InterfaceObserver();
@@ -651,9 +716,13 @@ class EthernetNetworkFactory {
 
     private String prefix2netmask(int prefix) {
         // convert prefix to netmask
-        int mask = 0xFFFFFFFF << (32 - prefix);
-        //Log.d(TAG, "mask = " + mask + " prefix = " + prefix);
-        return ((mask>>>24) & 0xff) + "." + ((mask>>>16) & 0xff) + "." + ((mask>>>8) & 0xff) + "." + ((mask) & 0xff);
+        if (true) {
+            int mask = 0xFFFFFFFF << (32 - prefix);
+            //Log.d(TAG, "mask = " + mask + " prefix = " + prefix);
+            return ((mask>>>24) & 0xff) + "." + ((mask>>>16) & 0xff) + "." + ((mask>>>8) & 0xff) + "." + ((mask) & 0xff);
+    	   } else {
+    	       return NetworkUtils.intToInetAddress(NetworkUtils.prefixLengthToNetmaskInt(prefix)).getHostName();
+    	   }
     }
 
     public String getNetmask() {
