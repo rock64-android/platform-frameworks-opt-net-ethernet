@@ -239,9 +239,9 @@ class EthernetNetworkFactory {
                 // Tell the agent we're disconnected. It will call disconnect().
                 mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
                 if (mConnectMode == IpAssignment.PPPOE) {
-                    Log.d(TAG, "before pppoe disconnect");
-                    mPppoeManager.disconnect(mIface);
-                    Log.d(TAG, "after pppoe disconnect");
+                    Log.d(TAG, "before pppoe stop");
+                    mPppoeManager.stopPppoe();
+                    Log.d(TAG, "after pppoe stop");
                 }
                 stopIpProvisioningThreadLocked();
                 sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
