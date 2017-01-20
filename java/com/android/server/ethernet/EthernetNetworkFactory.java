@@ -482,6 +482,12 @@ class EthernetNetworkFactory {
 
                     synchronized(EthernetNetworkFactory.this) {
                         stopIpManagerLocked();
+                        if (!isTrackingInterface()) {
+                            sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
+                            infoExitIpProvisioningThread();
+                            return;
+                        }
+
                         mIpManager = new IpManager(mContext, mIface, ipmCallback);
 
                         if (config.getProxySettings() == ProxySettings.STATIC ||
