@@ -626,11 +626,21 @@ class EthernetNetworkFactory {
                         // any real link up/down notification will only arrive
                         // after we've done this.
                         //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
-                        int carrier = getEthernetCarrierState(iface);
-                        Log.d(TAG, iface + " carrier = " + carrier);
-                        if (carrier == 1) {
-                            updateInterfaceState(iface, true);
-                        }
+                        new Thread(new Runnable() {
+                            public void run() {
+                                // carrier is always 1 when kernel boot up no matter RJ45 plugin or not, 
+                                // sleep a little time to wait kernel's correct carrier status
+                                try {
+                                    Thread.sleep(3000);
+                                } catch (InterruptedException ignore) {
+                                }
+                                int carrier = getEthernetCarrierState(iface);
+                                Log.d(TAG, iface + " carrier = " + carrier);
+                                if (carrier == 1) {
+                                    updateInterfaceState(iface, true);
+                                }
+                            }
+                        }).start();
                         break;
                     }
                 }
