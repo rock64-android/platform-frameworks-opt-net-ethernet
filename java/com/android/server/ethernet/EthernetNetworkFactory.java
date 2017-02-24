@@ -21,6 +21,7 @@ import android.net.ConnectivityManager;
 import android.net.DhcpResults;
 import android.net.EthernetManager;
 import android.net.IEthernetServiceListener;
+import android.net.PppoeManager;
 import android.net.InterfaceConfiguration;
 import android.net.IpConfiguration;
 import android.net.IpConfiguration.IpAssignment;
@@ -31,6 +32,8 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkFactory;
 import android.net.NetworkInfo;
 import android.net.NetworkInfo.DetailedState;
+import android.net.RouteInfo;
+import android.net.LinkAddress;
 import android.net.NetworkUtils;
 import android.net.StaticIpConfiguration;
 import android.os.Handler;
@@ -46,12 +49,7 @@ import android.content.Intent;
 import android.os.UserHandle;
 import android.provider.Settings;
 
-import com.android.internal.util.IndentingPrintWriter;
-import com.android.server.net.BaseNetworkObserver;
-
 import java.io.FileDescriptor;
-import java.io.PrintWriter;
-
 import java.io.File;
 import java.io.BufferedReader;
 import java.io.FileInputStream;
@@ -60,6 +58,15 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.Exception;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+
+import com.android.internal.util.IndentingPrintWriter;
+import com.android.server.net.BaseNetworkObserver;
+
+import java.io.FileDescriptor;
+import java.io.PrintWriter;
 
 /**
  * Manages connectivity for an Ethernet interface.
@@ -81,7 +88,7 @@ import java.lang.Exception;
 class EthernetNetworkFactory {
     private static final String NETWORK_TYPE = "Ethernet";
     private static final String TAG = "EthernetNetworkFactory";
-    private static final int NETWORK_SCORE = 150;
+    private static final int NETWORK_SCORE = 70;
     private static final boolean DBG = true;
     private static final boolean VDBG = false;
 
@@ -90,6 +97,8 @@ class EthernetNetworkFactory {
 
     /** For static IP configuration */
     private EthernetManager mEthernetManager;
+
+    private PppoeManager mPppoeManager;
 
     /** To set link state and configure IP addresses. */
     private INetworkManagementService mNMService;
@@ -108,24 +117,43 @@ class EthernetNetworkFactory {
 
     /** Data members. All accesses to these must be synchronized(this). */
     private static String mIface = "";
+    private static String mIfaceTmp = "";
     private String mHwAddr;
     private static boolean mLinkUp;
     private NetworkInfo mNetworkInfo;
     private LinkProperties mLinkProperties;
     public int mEthernetCurrentState = EthernetManager.ETHER_STATE_DISCONNECTED;
-    public int ethCurrentIfaceState = EthernetManager.ETHER_IFACE_STATE_DOWN;
+    private boolean mReconnecting;
+    private IpAssignment mConnectMode;
 
     private void LOGV(String code) {
         if(VDBG) Log.d(TAG,code);
     }
+
+    public String dumpEthCurrentState(int curState) {
+        if (curState == EthernetManager.ETHER_STATE_DISCONNECTED)
+            return "DISCONNECTED";
+        else if (curState == EthernetManager.ETHER_STATE_CONNECTING)
+            return "CONNECTING";
+        else if (curState == EthernetManager.ETHER_STATE_CONNECTED)
+            return "CONNECTED";
+        else if (curState == EthernetManager.ETHER_STATE_DISCONNECTING)
+            return "DISCONNECTING";
+        return "DISCONNECTED";
+    }
+
     private void sendEthernetStateChangedBroadcast(int curState) {
+        if (mEthernetCurrentState == curState)
+            return;
+        Log.d(TAG, "sendEthernetStateChangedBroadcast: curState = " + dumpEthCurrentState(curState));
         mEthernetCurrentState = curState;
         final Intent intent = new Intent(EthernetManager.ETHERNET_STATE_CHANGED_ACTION);
         intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT); 
         intent.putExtra(EthernetManager.EXTRA_ETHERNET_STATE, curState);
         mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
     }
-    private void sendEthIfaceStateChangedBroadcast(int curState) {
+
+    /*private void sendEthIfaceStateChangedBroadcast(int curState) {
         final Intent intent = new Intent(EthernetManager.ETHERNET_IFACE_STATE_CHANGED_ACTION);
         intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);  //  
         intent.putExtra(EthernetManager.EXTRA_ETHERNET_IFACE_STATE, curState);
@@ -135,6 +163,21 @@ class EthernetNetworkFactory {
                                  curState);
 
         mContext.sendStickyBroadcast(intent);
+    }*/
+
+    private String ReadFromFile(File file) {
+        if((file != null) && file.exists()) {
+            try {
+                FileInputStream fin= new FileInputStream(file);
+                BufferedReader reader= new BufferedReader(new InputStreamReader(fin));
+                String flag = reader.readLine();
+                fin.close();
+                return flag;
+            } catch(Exception e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
     }
 
     EthernetNetworkFactory(RemoteCallbackList<IEthernetServiceListener> listeners) {
@@ -165,14 +208,27 @@ class EthernetNetworkFactory {
         if (!mIface.equals(iface)) {
             return;
         }
-        Log.d(TAG, "updateInterface: " + iface + " link " + (up ? "up" : "down"));
+        if (!mReconnecting)
+            Log.d(TAG, "updateInterface: " + iface + " link " + (up ? "up" : "down"));
+
+        if (up && mEthernetCurrentState != EthernetManager.ETHER_STATE_DISCONNECTED) {
+            Log.d(TAG, "Already connected or connecting, skip connect");
+            return;
+        }
 
         synchronized(this) {
             mLinkUp = up;
             mNetworkInfo.setIsAvailable(up);
             if (!up) {
+                sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTING);
                 // Tell the agent we're disconnected. It will call disconnect().
                 mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
+                if (mConnectMode == IpAssignment.PPPOE) {
+                    Log.d(TAG, "before pppoe stop");
+                    mPppoeManager.stopPppoe();
+                    Log.d(TAG, "after pppoe stop");
+                }
+                NetworkUtils.stopDhcp(iface);
                 sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
             }
             updateAgent();
@@ -183,6 +239,38 @@ class EthernetNetworkFactory {
         }
     }
 
+    // first disconnect, then connect
+    public void reconnect(String iface) {
+        Log.d(TAG, "reconnect:");
+        mReconnecting = true;
+
+        if (iface == null)
+            iface = mIface;
+
+        Log.d(TAG, "first disconnect");
+        updateInterfaceState(iface, false);
+
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException ignore) {
+        }
+
+        Log.d(TAG, "then connect");
+        updateInterfaceState(iface, true);
+        mReconnecting = false;
+    }
+
+    public void disconnect(String iface) {
+        Log.d(TAG, "disconnect:");
+        mReconnecting = true;
+
+        if (iface == null)
+            iface = mIface;
+
+        updateInterfaceState(iface, false);
+        mReconnecting = false;
+    }
+
     private class InterfaceObserver extends BaseNetworkObserver {
         @Override
         public void interfaceLinkStateChanged(String iface, boolean up) {
@@ -191,113 +279,22 @@ class EthernetNetworkFactory {
 
         @Override
         public void interfaceAdded(String iface) {
+            Log.d(TAG, "interfaceAdded: " + iface);
             maybeTrackInterface(iface);
         }
 
         @Override
         public void interfaceRemoved(String iface) {
+            Log.d(TAG, "interfaceRemoved: " + iface);
             stopTrackingInterface(iface);
         }
     }
 
-    public int getEthernetIfaceState() {
-        // enforceAccessPermission();
-        //Log.d(TAG, "getEthernetIfaceState()");
-        File file = new File("/sys/class/net/"+mIface+"/flags");
-        String flags = ReadFromFile(file);
-//        Log.d(TAG, "flags="+flags);
-        if (flags == null) {
-            return EthernetManager.ETHER_IFACE_STATE_DOWN;
-        }
-
-        String flags_no_0x = flags.substring(2);
-        int flags_int = Integer.parseInt(flags_no_0x, 16);
-        if ((flags_int & 0x1)>0) {
-//            Log.d(TAG, "state=up");
-            return EthernetManager.ETHER_IFACE_STATE_UP;
-        } else {
-//            Log.d(TAG, "state=down");
-            return EthernetManager.ETHER_IFACE_STATE_DOWN;
-        }
-    }
-
-    private String ReadFromFile(File file) {
-        if((file != null) && file.exists()) {
-            try {
-                FileInputStream fin= new FileInputStream(file);
-                BufferedReader reader= new BufferedReader(new InputStreamReader(fin));
-                String flag = reader.readLine();
-                fin.close();
-                return flag;
-            }
-            catch(IOException e) {
-                e.printStackTrace();
-            }
-        }
-
-        return null;
-    }
-
-
-/*
-    public int getEthernetIfaceState() {
-        try {
-            final String[] ifaces = mNMService.listInterfaces();
-            for (String iface : ifaces) {
-                if (iface.matches(mIfaceMatch)) {
-                    if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
-                    }
-                }
-            }
-        } catch (RemoteException e) {
-            Log.e(TAG, "Could not get list of interfaces " + e);
-        }
-
-        return ETHER_IFACE_STATE_UP;
-    }
-*/
-    private void interfaceDown(String iface) {
-        mNetworkInfo.setIsAvailable(false);
-        sendEthIfaceStateChangedBroadcast(EthernetManager.ETHER_IFACE_STATE_DOWN);
-
-        mLinkProperties.clear();
-    }
-
-    public boolean setInterfaceDown() {
-        try {
-           if(!TextUtils.isEmpty(mIface)) {
-               mNMService.setInterfaceDown(mIface);
-               sendEthIfaceStateChangedBroadcast(EthernetManager.ETHER_IFACE_STATE_DOWN);
-               return true;
-           }
-           else 
-              Log.e(TAG,"mIface is null");
-        }catch (Exception e) {
-            Log.e(TAG, "Error downing interface " + mIface + ": " + e);
-        }
-        return false;
-    }
-    public boolean setInterfaceUp() {
-       try {
-           if(!TextUtils.isEmpty(mIface)) {
-               mNMService.setInterfaceUp(mIface);
-               sendEthIfaceStateChangedBroadcast(EthernetManager.ETHER_IFACE_STATE_UP);
-               return true;
-           }
-           else
-              Log.e(TAG,"mIface is null");
-        }catch (Exception e) {
-            Log.e(TAG, "Error downing interface " + mIface + ": " + e);
-        }
-      return false;
-    }
-
     private void setInterfaceUp(String iface) {
         // Bring up the interface so we get link status indications.
-        int ethernet_on = Settings.Secure.getInt(mContext.getContentResolver(), Settings.Secure.ETHERNET_ON, 1);
+        Log.d(TAG, "setInterfaceUp: " + iface);
 
         try {
-            NetworkUtils.stopDhcp(iface);
             mNMService.setInterfaceUp(iface);
             String hwAddr = null;
             InterfaceConfiguration config = mNMService.getInterfaceConfig(iface);
@@ -317,9 +314,6 @@ class EthernetNetworkFactory {
                     mNMService.setInterfaceDown(iface);
                 }
             }
-            if(ethernet_on == 0)
-                mNMService.setInterfaceDown(iface);
-
         } catch (Exception e) {
             Log.e(TAG, "Error upping interface " + mIface + ": " + e);
         }
@@ -348,11 +342,11 @@ class EthernetNetworkFactory {
             mNetworkInfo.setExtraInfo(null);
             mLinkUp = false;
             mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
-            sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
             updateAgent();
             mNetworkAgent = null;
             mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
             mLinkProperties = new LinkProperties();
+            sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
         }
     }
 
@@ -377,10 +371,7 @@ class EthernetNetworkFactory {
 
     public void updateAgent() {
         synchronized (EthernetNetworkFactory.this) {
-            if (mNetworkAgent == null) {
-                 LOGV("updateAgent== null return");
-                 return;
-            }
+            if (mNetworkAgent == null) return;
             if (DBG) {
                 Log.i(TAG, "Updating mNetworkAgent with: " +
                       mNetworkCapabilities + ", " +
@@ -398,21 +389,57 @@ class EthernetNetworkFactory {
     /* Called by the NetworkFactory on the handler thread. */
     public void onRequestNetwork() {
         // TODO: Handle DHCP renew.
+        int carrier = getEthernetCarrierState(mIface);
+        Log.d(TAG, "onRequestNetwork: " + mIface + " carrier = " + carrier);
+        if (carrier != 1) {
+            return;
+        }
+
+        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_CONNECTING);
         Thread dhcpThread = new Thread(new Runnable() {
             public void run() {
                 if (DBG) Log.i(TAG, "dhcpThread(" + mIface + "): mNetworkInfo=" + mNetworkInfo);
                 LinkProperties linkProperties;
 
                 IpConfiguration config = mEthernetManager.getConfiguration();
-
+                mConnectMode = config.getIpAssignment();
+                if (mPppoeManager == null) {
+                    mConnectMode = IpAssignment.DHCP;
+                    Log.d(TAG, "mPppoeManager == null, set mConnectMode to DHCP");
+                }
                 if (config.getIpAssignment() == IpAssignment.STATIC) {
+                    Log.d(TAG, "config STATIC");
                     if (!setStaticIpAddress(config.getStaticIpConfiguration())) {
                         // We've already logged an error.
+                        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                         return;
                     }
                     linkProperties = config.getStaticIpConfiguration().toLinkProperties(mIface);
+                } else if (config.getIpAssignment() == IpAssignment.PPPOE) {
+                    Log.d(TAG, "config PPPOE");
+                    Log.d(TAG, "start pppoe connect: " + config.pppoeAccount + ", " + config.pppoePassword);
+                    mPppoeManager.connect(config.pppoeAccount, config.pppoePassword, mIface);
+
+                    int state = mPppoeManager.getPppoeState();
+                    Log.d(TAG, "end pppoe connect: state = " + mPppoeManager.dumpCurrentState(state));
+                    if (state == PppoeManager.PPPOE_STATE_CONNECT) {
+                        linkProperties = mPppoeManager.getLinkProperties();
+                        String iface = mPppoeManager.getPppIfaceName();
+                        /*Log.d(TAG, "addInterfaceToLocalNetwork: iface = " + iface + ", route = " + linkProperties.getRoutes()); 
+                        try {
+                            mNMService.addInterfaceToLocalNetwork(iface, linkProperties.getRoutes());
+                        } catch (RemoteException e) {
+                            Log.e(TAG, "Failed to add iface " + iface + " to local network " + e);
+                        }*/
+                        linkProperties.setInterfaceName(iface);
+                    } else {
+                        Log.e(TAG, "pppoe connect failed.");
+                        //mFactory.setScoreFilter(-1);
+                        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
+                        return;
+                    }
                 } else {
-                    sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_CONNECTING);
+                    Log.d(TAG, "config DHCP");
                     mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
 
                     DhcpResults dhcpResults = new DhcpResults();
@@ -450,6 +477,7 @@ class EthernetNetworkFactory {
                         Log.e(TAG, "Already have a NetworkAgent - aborting new request");
                         return;
                     }
+                    Log.d(TAG, "success get ip: lp = " + linkProperties);
                     mLinkProperties = linkProperties;
                     mNetworkInfo.setIsAvailable(true);
                     mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
@@ -462,12 +490,12 @@ class EthernetNetworkFactory {
                         public void unwanted() {
                             synchronized(EthernetNetworkFactory.this) {
                                 if (this == mNetworkAgent) {
+                                    Log.d(TAG, "unwanted");
                                     NetworkUtils.stopDhcp(mIface);
 
                                     mLinkProperties.clear();
                                     mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null,
                                             mHwAddr);
-                                    sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                                     updateAgent();
                                     mNetworkAgent = null;
                                     try {
@@ -475,6 +503,7 @@ class EthernetNetworkFactory {
                                     } catch (Exception e) {
                                         Log.e(TAG, "Failed to clear addresses or disable ipv6" + e);
                                     }
+                                    sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
                                 } else {
                                     Log.d(TAG, "Ignoring unwanted as we have a more modern " +
                                             "instance");
@@ -488,24 +517,6 @@ class EthernetNetworkFactory {
         dhcpThread.start();
     }
 
-    private int getEthernetCarrierState() {
-        if(mIfaceMatch != "") {
-                try {
-                    File file = new File("/sys/class/net/"+"eth0"+"/carrier");
-                    String carrier = ReadFromFile(file);
-                    Log.d(TAG, "carrier = " + carrier);
-                    int carrier_int = Integer.parseInt(carrier);
-                    return carrier_int;
-                }
-            catch(Exception e) {
-                e.printStackTrace();
-                return 0;
-            }
-        } else {
-            return 0;
-        }
-    }
-
     /**
      * Begin monitoring connectivity
      */
@@ -514,10 +525,12 @@ class EthernetNetworkFactory {
         IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
         mNMService = INetworkManagementService.Stub.asInterface(b);
         mEthernetManager = (EthernetManager) context.getSystemService(Context.ETHERNET_SERVICE);
+        mPppoeManager = (PppoeManager) context.getSystemService(Context.PPPOE_SERVICE);
 
         // Interface match regex.
         mIfaceMatch = context.getResources().getString(
                 com.android.internal.R.string.config_ethernet_iface_regex);
+        Log.d(TAG, "EthernetNetworkFactory start " + mIfaceMatch);
 
         // Create and register our NetworkFactory.
         mFactory = new LocalNetworkFactory(NETWORK_TYPE, context, target.getLooper());
@@ -526,6 +539,8 @@ class EthernetNetworkFactory {
         mFactory.register();
 
         mContext = context;
+        mReconnecting = false;
+        mConnectMode = IpAssignment.DHCP;
 
         // Start tracking interface change events.
         mInterfaceObserver = new InterfaceObserver();
@@ -542,7 +557,7 @@ class EthernetNetworkFactory {
             for (String iface : ifaces) {
                 synchronized(this) {
                     if (maybeTrackInterface(iface)) {
-                        NetworkUtils.stopDhcp(iface);
+                        //NetworkUtils.stopDhcp(iface);
                         // We have our interface. Track it.
                         // Note: if the interface already has link (e.g., if we
                         // crashed and got restarted while it was running),
@@ -551,9 +566,22 @@ class EthernetNetworkFactory {
                         // any real link up/down notification will only arrive
                         // after we've done this.
                         //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
-                        if (getEthernetCarrierState() == 1) {
-                            updateInterfaceState(iface, true);
-                        }
+                        mIfaceTmp = iface;
+                        new Thread(new Runnable() {
+                            public void run() {
+                                // carrier is always 1 when kernel boot up no matter RJ45 plugin or not, 
+                                // sleep a little time to wait kernel's correct carrier status
+                                try {
+                                    Thread.sleep(3000);
+                                } catch (InterruptedException ignore) {
+                                }
+                                int carrier = getEthernetCarrierState(mIfaceTmp);
+                                Log.d(TAG, mIfaceTmp + " carrier = " + carrier);
+                                if (carrier == 1) {
+                                    updateInterfaceState(mIfaceTmp, true);
+                                }
+                            }
+                        }).start();
                         break;
                     }
                 }
@@ -564,6 +592,7 @@ class EthernetNetworkFactory {
     }
 
     public synchronized void stop() {
+        Log.d(TAG, "EthernetNetworkFactory stop");
         NetworkUtils.stopDhcp(mIface);
         // ConnectivityService will only forget our NetworkAgent if we send it a NetworkInfo object
         // with a state of DISCONNECTED or SUSPENDED. So we can't simply clear our NetworkInfo here:
@@ -578,7 +607,6 @@ class EthernetNetworkFactory {
         }
 
         mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
-        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
         mLinkUp = false;
         updateAgent();
         mLinkProperties = new LinkProperties();
@@ -586,6 +614,7 @@ class EthernetNetworkFactory {
         setInterfaceInfoLocked("", null);
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
         mFactory.unregister();
+        sendEthernetStateChangedBroadcast(EthernetManager.ETHER_STATE_DISCONNECTED);
     }
 
     private void initNetworkCapabilities() {
@@ -600,6 +629,113 @@ class EthernetNetworkFactory {
 
     public synchronized boolean isTrackingInterface() {
         return !TextUtils.isEmpty(mIface);
+    }
+
+    public int getEthernetCarrierState(String ifname) {
+        if(ifname != "") {
+            try {
+                File file = new File("/sys/class/net/" + ifname + "/carrier");
+                String carrier = ReadFromFile(file);
+                return Integer.parseInt(carrier);
+            } catch(Exception e) {
+                e.printStackTrace();
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    public String getEthernetMacAddress(String ifname) {
+        if(ifname != "") {
+            try {
+                File file = new File("/sys/class/net/" + ifname + "/address");
+                String address = ReadFromFile(file);
+                return address;
+            } catch(Exception e) {
+                e.printStackTrace();
+                return "";
+            }
+        } else {
+            return "";
+        }
+    }
+
+    public String getIpAddress() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return config.getStaticIpConfiguration().ipAddress.getAddress().getHostAddress();
+        } else {
+            for (LinkAddress l : mLinkProperties.getLinkAddresses()) {
+                InetAddress source = l.getAddress();
+                //Log.d(TAG, "getIpAddress: " + source.getHostAddress());
+                if (source instanceof Inet4Address) {
+                    return source.getHostAddress();
+                }
+            }
+        }
+        return "";
+    }
+
+    private String prefix2netmask(int prefix) {
+        // convert prefix to netmask
+        if (true) {
+            int mask = 0xFFFFFFFF << (32 - prefix);
+            //Log.d(TAG, "mask = " + mask + " prefix = " + prefix);
+            return ((mask>>>24) & 0xff) + "." + ((mask>>>16) & 0xff) + "." + ((mask>>>8) & 0xff) + "." + ((mask) & 0xff);
+    	   } else {
+    	       return NetworkUtils.intToInetAddress(NetworkUtils.prefixLengthToNetmaskInt(prefix)).getHostName();
+    	   }
+    }
+
+    public String getNetmask() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return prefix2netmask(config.getStaticIpConfiguration().ipAddress.getPrefixLength());
+        } else {
+            for (LinkAddress l : mLinkProperties.getLinkAddresses()) {
+                InetAddress source = l.getAddress();
+                if (source instanceof Inet4Address) {
+                    return prefix2netmask(l.getPrefixLength());
+                }
+            }
+        }
+        return "";
+    }
+	
+    public String getGateway() {
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            return config.getStaticIpConfiguration().gateway.getHostAddress();
+        } else {
+            for (RouteInfo route : mLinkProperties.getRoutes()) {
+                if (route.hasGateway()) {
+                    InetAddress gateway = route.getGateway();
+                    if (route.isIPv4Default()) {
+                        return gateway.getHostAddress();
+                    }
+                }
+            }
+        }
+        return "";		
+    }
+
+    /*
+     * return dns format: "8.8.8.8,4.4.4.4"
+     */
+    public String getDns() {
+        String dns = "";
+        IpConfiguration config = mEthernetManager.getConfiguration();
+        if (config.getIpAssignment() == IpAssignment.STATIC) {
+            for (InetAddress nameserver : config.getStaticIpConfiguration().dnsServers) {
+                dns += nameserver.getHostAddress() + ",";
+            }			
+        } else {		
+            for (InetAddress nameserver : mLinkProperties.getDnsServers()) {
+                dns += nameserver.getHostAddress() + ",";
+            }
+        }
+        return dns;		
     }
 
     /**
@@ -635,6 +771,9 @@ class EthernetNetworkFactory {
         } else {
             pw.println("Not tracking any interface");
         }
+
+        pw.println();
+        pw.println("mEthernetCurrentState: " + dumpEthCurrentState(mEthernetCurrentState));
 
         pw.println();
         pw.println("NetworkInfo: " + mNetworkInfo);

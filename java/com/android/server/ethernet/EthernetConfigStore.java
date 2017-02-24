@@ -41,7 +41,7 @@ public class EthernetConfigStore extends IpConfigStore {
     public IpConfiguration readIpAndProxyConfigurations() {
         SparseArray<IpConfiguration> networks = readIpAndProxyConfigurations(ipConfigFile);
 
-        if (networks.size() == 0) {
+        if (networks == null || networks.size() == 0) {
             Log.w(TAG, "No Ethernet configuration found. Using default.");
             return new IpConfiguration(IpAssignment.DHCP, ProxySettings.NONE, null, null);
         }
