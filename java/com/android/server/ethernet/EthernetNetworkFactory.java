@@ -121,6 +121,7 @@ class EthernetNetworkFactory {
 
     /** Data members. All accesses to these must be synchronized(this). */
     private static String mIface = "";
+    private static String mIfaceTmp = "";
     private String mHwAddr;
     private static boolean mLinkUp;
     private NetworkInfo mNetworkInfo;
@@ -602,6 +603,7 @@ class EthernetNetworkFactory {
         mContext = context;
         mReconnecting = false;
         mConnectMode = IpAssignment.DHCP;
+        mLinkUp = false;
 
         // Start tracking interface change events.
         mInterfaceObserver = new InterfaceObserver();
@@ -626,6 +628,7 @@ class EthernetNetworkFactory {
                         // any real link up/down notification will only arrive
                         // after we've done this.
                         //if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                        mIfaceTmp = iface;
                         new Thread(new Runnable() {
                             public void run() {
                                 // carrier is always 1 when kernel boot up no matter RJ45 plugin or not, 
@@ -634,10 +637,10 @@ class EthernetNetworkFactory {
                                     Thread.sleep(3000);
                                 } catch (InterruptedException ignore) {
                                 }
-                                int carrier = getEthernetCarrierState(iface);
-                                Log.d(TAG, iface + " carrier = " + carrier);
+                                int carrier = getEthernetCarrierState(mIfaceTmp);
+                                Log.d(TAG, mIfaceTmp + " carrier = " + carrier);
                                 if (carrier == 1) {
-                                    updateInterfaceState(iface, true);
+                                    updateInterfaceState(mIfaceTmp, true);
                                 }
                             }
                         }).start();
